@@ -1,0 +1,85 @@
+import cv2
+import numpy as np
+import torch  # For tensor handling
+
+class BlobPointGenerator:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "light_hue_min": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 360.0, "step": 1.0}),
+                "light_hue_max": ("FLOAT", {"default": 360.0, "min": 0.0, "max": 360.0, "step": 1.0}),
+                "light_sat_min": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "light_val_min": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "dark_hue_min": ("FLOAT", {"default": 100.0, "min": 0.0, "max": 360.0, "step": 1.0}),
+                "dark_hue_max": ("FLOAT", {"default": 150.0, "min": 0.0, "max": 360.0, "step": 1.0}),
+                "dark_val_max": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "min_blob_size": ("INT", {"default": 100, "min": 10, "max": 10000, "step": 10}),
+                "num_positive_points": ("INT", {"default": 3, "min": 1, "max": 10, "step": 1}),
+                "num_negative_points": ("INT", {"default": 2, "min": 1, "max": 10, "step": 1}),
+                "erosion_kernel": ("INT", {"default": 3, "min": 1, "max": 10, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("LIST", "LIST", "IMAGE")
+    RETURN_NAMES = ("positive_points", "negative_points", "debug_mask")
+    FUNCTION = "generate_points"
+    CATEGORY = "image/processing"
+
+    def generate_points(self, image, light_hue_min, light_hue_max, light_sat_min, light_val_min,
+                        dark_hue_min, dark_hue_max, dark_val_max, min_blob_size,
+                        num_positive_points, num_negative_points, erosion_kernel):
+        # Convert tensor to numpy (assume batch=1)
+        img_np = image[0].cpu().numpy() * 255  # [H, W, C] uint8
+        img_np = img_np.astype(np.uint8)
+        h, w, _ = img_np.shape
+
+        # Convert to HSV
+        hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
+
+        # Light mask (scale HSV to OpenCV ranges: H=0-180, S/V=0-255)
+        light_lower = np.array([light_hue_min / 2, light_sat_min * 255, light_val_min * 255])
+        light_upper = np.array([light_hue_max / 2, 255, 255])
+        light_mask = cv2.inRange(hsv, light_lower, light_upper)
+
+        # Dark mask
+        dark_lower = np.array([dark_hue_min / 2, 0, 0])
+        dark_upper = np.array([dark_hue_max / 2, 255, dark_val_max * 255])
+        dark_mask = cv2.inRange(hsv, dark_lower, dark_upper)
+
+        # Morphology to separate blobs
+        kernel = np.ones((erosion_kernel, erosion_kernel), np.uint8)
+        light_mask = cv2.erode(light_mask, kernel, iterations=1)
+        light_mask = cv2.dilate(light_mask, kernel, iterations=1)
+        dark_mask = cv2.erode(dark_mask, kernel, iterations=1)
+        dark_mask = cv2.dilate(dark_mask, kernel, iterations=1)
+
+        # Detect blobs (using connectedComponentsWithStats for efficiency)
+        def get_centroids(mask, min_size, max_num):
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+            valid_centroids = []
+            areas = stats[1:, cv2.CC_STAT_AREA]  # Skip background
+            sorted_idx = np.argsort(-areas)  # Largest first
+            for idx in sorted_idx:
+                if areas[idx] >= min_size:
+                    cx, cy = centroids[idx + 1]  # +1 for background skip
+                    valid_centroids.append([cx / w, cy / h])  # Normalize
+                if len(valid_centroids) >= max_num:
+                    break
+            return valid_centroids
+
+        positive_points = get_centroids(light_mask, min_blob_size, num_positive_points)
+        negative_points = get_centroids(dark_mask, min_blob_size, num_negative_points)
+
+        # Debug mask: Combine light (green) and dark (red) on original
+        debug_img = img_np.copy()
+        debug_img[light_mask > 0] = [0, 255, 0]  # Green for light
+        debug_img[dark_mask > 0] = [0, 0, 255]  # Red for dark
+        debug_tensor = torch.from_numpy(debug_img / 255.0).unsqueeze(0)  # [1, H, W, C]
+
+        return (positive_points, negative_points, debug_tensor)
+
+# Register the node
+NODE_CLASS_MAPPINGS = {"BlobPointGenerator": BlobPointGenerator}
+NODE_DISPLAY_NAME_MAPPINGS = {"BlobPointGenerator": "Blob Point Generator for SAM2"}

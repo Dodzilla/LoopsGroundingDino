@@ -1,5 +1,7 @@
 import os
 import sys
+import uuid
+import cv2
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -239,7 +241,22 @@ def split_image_mask(image):
     return (image_rgb, mask)
 
 
-def sam_segment(sam_model, image, boxes):
+def get_centroids(mask, min_size, max_num):
+    valid_centroids = []
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels > 1:
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        sorted_idx = np.argsort(-areas)
+        for idx in sorted_idx:
+            if areas[idx] >= min_size:
+                cx, cy = centroids[idx + 1]
+                valid_centroids.append([cx, cy])
+            if len(valid_centroids) >= max_num:
+                break
+    return valid_centroids
+
+
+def sam_segment(sam_model, image, boxes, point_coords=None, point_labels=None):
     if boxes.shape[0] == 0:
         return None
     predictor = SAM2ImagePredictor(sam_model)
@@ -248,7 +265,7 @@ def sam_segment(sam_model, image, boxes):
     predictor.set_image(image_np_rgb)
     sam_device = comfy.model_management.get_torch_device()
     masks, scores, _ = predictor.predict(
-        point_coords=None, point_labels=None, box=boxes, multimask_output=False
+        point_coords=point_coords, point_labels=point_labels, box=boxes, multimask_output=False
     )
     print("scores: ", scores)
     print("masks shape before any modification:", masks.shape)
@@ -308,6 +325,18 @@ class GroundingDinoSAM2Segment:
                     "FLOAT",
                     {"default": 0.3, "min": 0, "max": 1.0, "step": 0.01},
                 ),
+                "enable_blob_detection": (["true", "false"], {"default": "false"}),
+                "light_hue_min": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 360.0, "step": 1.0}),
+                "light_hue_max": ("FLOAT", {"default": 360.0, "min": 0.0, "max": 360.0, "step": 1.0}),
+                "light_sat_min": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "light_val_min": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "dark_hue_min": ("FLOAT", {"default": 100.0, "min": 0.0, "max": 360.0, "step": 1.0}),
+                "dark_hue_max": ("FLOAT", {"default": 150.0, "min": 0.0, "max": 360.0, "step": 1.0}),
+                "dark_val_max": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "min_blob_size": ("INT", {"default": 100, "min": 10, "max": 10000, "step": 10}),
+                "num_positive_points": ("INT", {"default": 3, "min": 1, "max": 10, "step": 1}),
+                "num_negative_points": ("INT", {"default": 2, "min": 1, "max": 10, "step": 1}),
+                "erosion_kernel": ("INT", {"default": 3, "min": 1, "max": 10, "step": 1}),
             }
         }
 
@@ -315,26 +344,69 @@ class GroundingDinoSAM2Segment:
     FUNCTION = "main"
     RETURN_TYPES = ("IMAGE", "MASK")
 
-    def main(self, grounding_dino_model, sam_model, image, prompt, threshold):
+    def main(self, grounding_dino_model, sam_model, image, prompt, threshold, enable_blob_detection, light_hue_min, light_hue_max, light_sat_min, light_val_min, dark_hue_min, dark_hue_max, dark_val_max, min_blob_size, num_positive_points, num_negative_points, erosion_kernel):
         res_images = []
         res_masks = []
+        previews = []
+        temp_path = folder_paths.get_temp_directory()
         for item in image:
             item = Image.fromarray(
                 np.clip(255.0 * item.cpu().numpy(), 0, 255).astype(np.uint8)
             ).convert("RGBA")
             boxes = groundingdino_predict(grounding_dino_model, item, prompt, threshold)
             if boxes.shape[0] == 0:
-                break
-            (images, masks) = sam_segment(sam_model, item, boxes)
+                continue
+
+            point_coords = None
+            point_labels = None
+            if enable_blob_detection == "true":
+                img_np = np.array(item)[:, :, :3]  # RGB
+                hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
+                light_lower = np.array([light_hue_min / 2, light_sat_min * 255, light_val_min * 255])
+                light_upper = np.array([light_hue_max / 2, 255, 255])
+                light_mask = cv2.inRange(hsv, light_lower, light_upper)
+                dark_lower = np.array([dark_hue_min / 2, 0, 0])
+                dark_upper = np.array([dark_hue_max / 2, 255, dark_val_max * 255])
+                dark_mask = cv2.inRange(hsv, dark_lower, dark_upper)
+                kernel = np.ones((erosion_kernel, erosion_kernel), np.uint8)
+                light_mask = cv2.erode(light_mask, kernel, iterations=1)
+                light_mask = cv2.dilate(light_mask, kernel, iterations=1)
+                dark_mask = cv2.erode(dark_mask, kernel, iterations=1)
+                dark_mask = cv2.dilate(dark_mask, kernel, iterations=1)
+                positive_points = get_centroids(light_mask, min_blob_size, num_positive_points)
+                negative_points = get_centroids(dark_mask, min_blob_size, num_negative_points)
+                if positive_points or negative_points:
+                    all_points = positive_points + negative_points
+                    point_coords = np.array(all_points)
+                    point_labels = np.array([1] * len(positive_points) + [0] * len(negative_points))
+
+            # Create preview image
+            debug_img = np.array(item)[:, :, :3]  # RGB copy
+            debug_img_bgr = cv2.cvtColor(debug_img, cv2.COLOR_RGB2BGR)
+            boxes_np = boxes.numpy().astype(int)
+            for box in boxes_np:
+                x1, y1, x2, y2 = box
+                cv2.rectangle(debug_img_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)  # green box
+            if point_coords is not None:
+                for i, pt in enumerate(point_coords):
+                    color = (0, 255, 0) if point_labels[i] == 1 else (0, 0, 255)  # green pos, red neg
+                    cv2.circle(debug_img_bgr, (int(pt[0]), int(pt[1])), 5, color, -1)
+            debug_img_rgb = cv2.cvtColor(debug_img_bgr, cv2.COLOR_BGR2RGB)
+            fn = f"{uuid.uuid4()}.png"
+            full_path = os.path.join(temp_path, fn)
+            Image.fromarray(debug_img_rgb).save(full_path)
+            previews.append({"filename": fn, "subfolder": "", "type": "temp"})
+
+            (images, masks) = sam_segment(sam_model, item, boxes, point_coords, point_labels)
             res_images.extend(images)
             res_masks.extend(masks)
         if len(res_images) == 0:
-            _, height, width, _ = image.size()
+            _, height, width, _ = image.shape
             empty_mask = torch.zeros(
                 (1, height, width), dtype=torch.uint8, device="cpu"
             )
-            return (empty_mask, empty_mask)
-        return (torch.cat(res_images, dim=0), torch.cat(res_masks, dim=0))
+            return {"ui": {"images": []}, "result": (empty_mask, empty_mask)}
+        return {"ui": {"images": previews}, "result": (torch.cat(res_images, dim=0), torch.cat(res_masks, dim=0))}
 
 
 class InvertMask:

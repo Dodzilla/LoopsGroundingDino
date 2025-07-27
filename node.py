@@ -334,8 +334,8 @@ class GroundingDinoSAM2Segment:
                 "dark_hue_max": ("FLOAT", {"default": 150.0, "min": 0.0, "max": 360.0, "step": 1.0}),
                 "dark_val_max": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "min_blob_size": ("INT", {"default": 100, "min": 10, "max": 10000, "step": 10}),
-                "num_positive_points": ("INT", {"default": 3, "min": 1, "max": 10, "step": 1}),
-                "num_negative_points": ("INT", {"default": 2, "min": 1, "max": 10, "step": 1}),
+                "num_positive_points": ("INT", {"default": 3, "min": 0, "max": 10, "step": 1}),
+                "num_negative_points": ("INT", {"default": 2, "min": 0, "max": 10, "step": 1}),
                 "erosion_kernel": ("INT", {"default": 3, "min": 1, "max": 10, "step": 1}),
             }
         }
@@ -373,8 +373,10 @@ class GroundingDinoSAM2Segment:
                 light_mask = cv2.dilate(light_mask, kernel, iterations=1)
                 dark_mask = cv2.erode(dark_mask, kernel, iterations=1)
                 dark_mask = cv2.dilate(dark_mask, kernel, iterations=1)
-                positive_points = get_centroids(light_mask, min_blob_size, num_positive_points)
-                negative_points = get_centroids(dark_mask, min_blob_size, num_negative_points)
+                if num_positive_points > 0:
+                    positive_points = get_centroids(light_mask, min_blob_size, num_positive_points)
+                if num_negative_points > 0:
+                    negative_points = get_centroids(dark_mask, min_blob_size, num_negative_points)
                 if positive_points or negative_points:
                     all_points = positive_points + negative_points
                     point_coords = np.array(all_points)

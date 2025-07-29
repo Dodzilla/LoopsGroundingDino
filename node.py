@@ -325,6 +325,10 @@ class GroundingDinoSAM2Segment:
                     "FLOAT",
                     {"default": 0.3, "min": 0, "max": 1.0, "step": 0.01},
                 ),
+                "max_bounding_boxes": (
+                    "INT",
+                    {"default": 1, "min": 1, "max": 10, "step": 1},
+                ),
                 "enable_blob_detection": (["true", "false"], {"default": "false"}),
                 "light_hue_min": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 360.0, "step": 1.0}),
                 "light_hue_max": ("FLOAT", {"default": 360.0, "min": 0.0, "max": 360.0, "step": 1.0}),
@@ -344,7 +348,7 @@ class GroundingDinoSAM2Segment:
     FUNCTION = "main"
     RETURN_TYPES = ("IMAGE", "MASK")
 
-    def main(self, grounding_dino_model, sam_model, image, prompt, threshold, enable_blob_detection, light_hue_min, light_hue_max, light_sat_min, light_val_min, dark_hue_min, dark_hue_max, dark_val_max, min_blob_size, num_positive_points, num_negative_points, erosion_kernel):
+    def main(self, grounding_dino_model, sam_model, image, prompt, threshold, max_bounding_boxes, enable_blob_detection, light_hue_min, light_hue_max, light_sat_min, light_val_min, dark_hue_min, dark_hue_max, dark_val_max, min_blob_size, num_positive_points, num_negative_points, erosion_kernel):
         res_images = []
         res_masks = []
         previews = []
@@ -356,6 +360,10 @@ class GroundingDinoSAM2Segment:
             boxes = groundingdino_predict(grounding_dino_model, item, prompt, threshold)
             if boxes.shape[0] == 0:
                 continue
+
+            # Limit the number of bounding boxes to the specified maximum
+            if boxes.shape[0] > max_bounding_boxes:
+                boxes = boxes[:max_bounding_boxes]
 
             point_coords = None
             point_labels = None

@@ -1,5 +1,6 @@
 
 import os
+import sys
 import uuid
 import copy
 import numpy as np
@@ -11,6 +12,9 @@ import folder_paths
 import comfy.model_management
 
 # External modules already present in the original node package
+# Match node.py behavior: ensure this package dir is on sys.path
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 from local_groundingdino.datasets import transforms as T
 

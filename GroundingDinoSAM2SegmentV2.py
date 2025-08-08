@@ -161,8 +161,19 @@ def create_tensor_output(image_np, masks, boxes_filt):
     boxes_filt = boxes_filt.detach().cpu().numpy().astype(int) if boxes_filt is not None and hasattr(boxes_filt, "detach") else (boxes_filt.astype(int) if boxes_filt is not None else None)
     for mask in masks:
         image_np_copy = copy.deepcopy(image_np)
-        # union across K (axis=0)
-        union_mask = np.any(mask, axis=0)
+        # Normalize mask to 2D (H, W)
+        mask_bool = mask.astype(bool)
+        if mask_bool.ndim == 2:
+            union_mask = mask_bool
+        elif mask_bool.ndim == 3:
+            # (K, H, W) -> (H, W)
+            union_mask = np.any(mask_bool, axis=0)
+        elif mask_bool.ndim == 4:
+            # (B, K, H, W) -> (H, W)
+            union_mask = np.any(mask_bool, axis=(0, 1))
+        else:
+            raise ValueError(f"Unsupported mask ndim: {mask_bool.ndim}, expected 2/3/4")
+
         image_np_copy[~union_mask] = np.array([0, 0, 0, 0])
         output_image, output_mask = split_image_mask(Image.fromarray(image_np_copy))
         output_masks.append(output_mask)

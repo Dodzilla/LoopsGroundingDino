@@ -758,22 +758,3 @@ class GroundingDinoSAM2SegmentV2Ex:
             )
             return {"ui": {"images": []}, "result": (empty_mask, empty_mask)}
         return {"ui": {"images": previews}, "result": (torch.cat(res_images, dim=0), torch.cat(res_masks, dim=0))}
-
-
-# Register new node without disturbing existing mapping if defined elsewhere
-try:
-    NODE_CLASS_MAPPINGS
-except NameError:
-    NODE_CLASS_MAPPINGS = {}
-try:
-    NODE_DISPLAY_NAME_MAPPINGS
-except NameError:
-    NODE_DISPLAY_NAME_MAPPINGS = {}
-
-NODE_CLASS_MAPPINGS.update({
-    "GroundingDinoSAM2SegmentV2Ex": GroundingDinoSAM2SegmentV2Ex,
-})
-
-NODE_DISPLAY_NAME_MAPPINGS.update({
-    "GroundingDinoSAM2SegmentV2Ex": "GroundingDINO + SAM2 Segment (V2Ex: multi-run + multimask)",
-})

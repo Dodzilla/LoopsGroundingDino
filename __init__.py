@@ -1,4 +1,4 @@
-from .GroundingDinoSAM2SegmentV2 import GroundingDinoSAM2SegmentV2
+from .GroundingDinoSAM2SegmentV2 import GroundingDinoSAM2SegmentV2, GroundingDinoSAM2SegmentV2Ex
 from .node import SAM2ModelLoader, GroundingDinoModelLoader, GroundingDinoSAM2Segment, InvertMask, IsMaskEmptyNode
 
 NODE_CLASS_MAPPINGS = {
@@ -8,6 +8,7 @@ NODE_CLASS_MAPPINGS = {
     'InvertMask (segment anything)': InvertMask,
     "IsMaskEmpty": IsMaskEmptyNode,
     "GroundingDinoSAM2SegmentV2": GroundingDinoSAM2SegmentV2,
+    "GroundingDinoSAM2SegmentV2Ex": GroundingDinoSAM2SegmentV2Ex,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -17,4 +18,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     'InvertMask': 'Invert Mask',
     "IsMaskEmpty": "Is Mask Empty",
     "GroundingDinoSAM2SegmentV2": "GroundingDINO + SAM2 Segment (V2: score+NMS+mid-quantile)",
+    "GroundingDinoSAM2SegmentV2Ex": "GroundingDINO + SAM2 Segment (V2Ex: multi-run + multimask)",
 }

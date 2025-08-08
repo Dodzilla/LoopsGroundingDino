@@ -382,3 +382,398 @@ class GroundingDinoSAM2SegmentV2:
             return {"ui": {"images": []}, "result": (empty_mask, empty_mask)}
         return {"ui": {"images": previews}, "result": (torch.cat(res_images, dim=0), torch.cat(res_masks, dim=0))}
 
+
+# =============================
+# V2Ex helpers (do not override V2)
+# =============================
+
+def _load_dino_image_at_scale_v2ex(image_pil, short_side=800):
+    transform = T.Compose(
+        [
+            T.RandomResize([int(short_side)], max_size=1333),
+            T.ToTensor(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    )
+    image, _ = transform(image_pil.convert("RGB"), None)
+    return image
+
+def _expand_and_clip_boxes_v2ex(boxes_xyxy_t, pad_frac, W, H):
+    if boxes_xyxy_t.numel() == 0:
+        return boxes_xyxy_t
+    wh = torch.stack([(boxes_xyxy_t[:,2]-boxes_xyxy_t[:,0]), (boxes_xyxy_t[:,3]-boxes_xyxy_t[:,1])], dim=1)
+    pad = wh * pad_frac
+    x1 = (boxes_xyxy_t[:,0] - pad[:,0]).clamp(0, W-1)
+    y1 = (boxes_xyxy_t[:,1] - pad[:,1]).clamp(0, H-1)
+    x2 = (boxes_xyxy_t[:,2] + pad[:,0]).clamp(0, W-1)
+    y2 = (boxes_xyxy_t[:,3] + pad[:,1]).clamp(0, H-1)
+    return torch.stack([x1,y1,x2,y2], dim=1)
+
+def _parse_float_list_v2ex(s, default_list=None):
+    if s is None:
+        return default_list[:] if default_list is not None else []
+    s = str(s).strip()
+    if not s:
+        return default_list[:] if default_list is not None else []
+    out = []
+    for tok in s.split("|"):
+        tok = tok.strip()
+        try:
+            out.append(float(tok))
+        except Exception:
+            pass
+    # dedupe while preserving order
+    seen = set()
+    uniq = []
+    for x in out:
+        if x not in seen:
+            uniq.append(x); seen.add(x)
+    return uniq
+
+def _parse_int_list_v2ex(s, default_list=None):
+    if s is None:
+        return default_list[:] if default_list is not None else []
+    s = str(s).strip()
+    if not s:
+        return default_list[:] if default_list is not None else []
+    out = []
+    for tok in s.split("|"):
+        tok = tok.strip()
+        try:
+            out.append(int(tok))
+        except Exception:
+            pass
+    # dedupe
+    seen = set()
+    uniq = []
+    for x in out:
+        if x not in seen:
+            uniq.append(x); seen.add(x)
+    return uniq
+
+def _collect_dino_candidates_multi_v2ex(dino_model, image_pil, base_prompt, prompts_extra,
+                                        thresholds, scales, nms_iou, max_after_merge):
+    """
+    Run DINO across (prompt in {base, variants}) x (thresholds) x (scales).
+    Merge all boxes with a global NMS, keep top-K by score.
+    Returns (boxes_xyxy_t, scores_t)
+    """
+    W, H = image_pil.size
+    all_boxes = []
+    all_scores = []
+
+    prompts = [base_prompt] + [p for p in prompts_extra if p.strip()]
+    for p in prompts:
+        for thr in thresholds:
+            for s in scales:
+                # build DINO input at this scale
+                dino_image = _load_dino_image_at_scale_v2ex(image_pil, short_side=s)
+                # forward
+                boxes_n, scores = _get_grounding_output_with_scores(dino_model, dino_image, p, thr)
+                if boxes_n.numel() == 0:
+                    continue
+                boxes_xyxy = _xywhn_to_xyxy_abs(boxes_n, W, H)  # map to original coords (consistent with V2)
+                all_boxes.append(boxes_xyxy)
+                all_scores.append(scores)
+
+    if not all_boxes:
+        return torch.empty((0,4), dtype=torch.float32), torch.empty((0,), dtype=torch.float32)
+
+    boxes_cat = torch.cat(all_boxes, dim=0)
+    scores_cat = torch.cat(all_scores, dim=0)
+
+    # Global NMS to dedupe across passes
+    keep = _nms_xyxy(boxes_cat, scores_cat, iou_thr=nms_iou)
+    boxes_cat = boxes_cat[keep]
+    scores_cat = scores_cat[keep]
+
+    # Keep top-K by score
+    order = scores_cat.argsort(descending=True)
+    order = order[:max_after_merge]
+    return boxes_cat[order], scores_cat[order]
+
+def _tile_boxes_with_paddings_v2ex(boxes_xyxy_t, paddings, W, H):
+    if boxes_xyxy_t.numel() == 0:
+        return boxes_xyxy_t, []
+    out_boxes = []
+    pad_index = []
+    for pi, pf in enumerate(paddings):
+        out_boxes.append(_expand_and_clip_boxes_v2ex(boxes_xyxy_t, pf, W, H))
+        pad_index.extend([pi] * boxes_xyxy_t.shape[0])
+    return torch.cat(out_boxes, dim=0), pad_index
+
+def _flatten_sam_masks_v2ex(masks, boxes_xyxy_t, sam_multimask):
+    """
+    Normalize SAM outputs to (N, H, W) and expand boxes to match N.
+    If multimask=True and SAM returned (B, M, H, W), we reshape to (B*M, H, W).
+    """
+    if masks.ndim == 2:
+        masks_b = masks[None, ...]
+        boxes_rep = boxes_xyxy_t
+    elif masks.ndim == 3:
+        masks_b = masks
+        boxes_rep = boxes_xyxy_t
+    elif masks.ndim == 4:
+        # (B, M, H, W) -> (B*M, H, W)
+        B, M, H, W = masks.shape
+        masks_b = masks.reshape(B*M, H, W)
+        boxes_rep = boxes_xyxy_t.repeat_interleave(M, dim=0)
+    else:
+        raise ValueError(f"SAM returned unexpected ndim={masks.ndim}")
+    masks_b = (masks_b > 0).astype(np.uint8)
+    return masks_b, boxes_rep
+
+# =============================
+# V2Ex Node
+# =============================
+
+class GroundingDinoSAM2SegmentV2Ex:
+    """
+    V2Ex: diversity-first variant
+      - Multi-pass GroundingDINO across thresholds/scales/optional prompt variants
+      - Optional box paddings to produce multiple SAM inputs per detection
+      - Optional SAM multimask_output to get multiple proposals per box
+      - Area/box filtering (quantiles + absolute bounds), union survivors
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "sam_model": ("SAM2_MODEL", {}),
+                "grounding_dino_model": ("GROUNDING_DINO_MODEL", {}),
+                "image": ("IMAGE", {}),
+                "prompt": ("STRING", {}),
+                "threshold": ("FLOAT", {"default": 0.3, "min": 0, "max": 1.0, "step": 0.01}),
+                "max_bounding_boxes": ("INT", {"default": 4, "min": 1, "max": 30, "step": 1}),
+
+                # Diversity controls
+                "dino_thresholds": ("STRING", {"default": "0.25|0.30"}),
+                "dino_scales": ("STRING", {"default": "736|800|896"}),
+                "prompt_variants": ("STRING", {"default": ""}),  # e.g., "dalmatian dog|purple hair|tail"
+                "box_paddings": ("STRING", {"default": "0.0|0.08"}),  # fraction of box size
+
+                "sam_multimask_output": (["false", "true"], {"default": "true"}),
+                "max_candidates_after_merge": ("INT", {"default": 8, "min": 1, "max": 64, "step": 1}),
+                "max_sam_boxes": ("INT", {"default": 12, "min": 1, "max": 128, "step": 1}),
+
+                # Area filter knobs
+                "area_low_q": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "area_high_q": ("FLOAT", {"default": 0.80, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "area_min_ratio": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "area_max_ratio": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.0, "step": 0.01}),
+
+                # Blob detection (kept compatible)
+                "enable_blob_detection": (["true", "false"], {"default": "false"}),
+                "light_hue_min": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 360.0, "step": 1.0}),
+                "light_hue_max": ("FLOAT", {"default": 360.0, "min": 0.0, "max": 360.0, "step": 1.0}),
+                "light_sat_min": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "light_val_min": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "dark_hue_min": ("FLOAT", {"default": 100.0, "min": 0.0, "max": 360.0, "step": 1.0}),
+                "dark_hue_max": ("FLOAT", {"default": 150.0, "min": 0.0, "max": 360.0, "step": 1.0}),
+                "dark_val_max": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "min_blob_size": ("INT", {"default": 100, "min": 10, "max": 10000, "step": 10}),
+                "num_positive_points": ("INT", {"default": 3, "min": 0, "max": 10, "step": 1}),
+                "num_negative_points": ("INT", {"default": 2, "min": 0, "max": 10, "step": 1}),
+                "erosion_kernel": ("INT", {"default": 3, "min": 1, "max": 10, "step": 1}),
+            }
+        }
+
+    CATEGORY = "segment_anything2 (V2+)"
+    FUNCTION = "main"
+    RETURN_TYPES = ("IMAGE", "MASK")
+
+    def main(self, grounding_dino_model, sam_model, image, prompt, threshold, max_bounding_boxes,
+             dino_thresholds, dino_scales, prompt_variants, box_paddings,
+             sam_multimask_output, max_candidates_after_merge, max_sam_boxes,
+             area_low_q, area_high_q, area_min_ratio, area_max_ratio,
+             enable_blob_detection, light_hue_min, light_hue_max, light_sat_min, light_val_min,
+             dark_hue_min, dark_hue_max, dark_val_max, min_blob_size, num_positive_points,
+             num_negative_points, erosion_kernel):
+
+        res_images = []
+        res_masks = []
+        previews = []
+        temp_path = folder_paths.get_temp_directory()
+
+        # Parse sweep inputs
+        thresholds = _parse_float_list_v2ex(dino_thresholds, default_list=[threshold])
+        if threshold not in thresholds:
+            thresholds.append(float(threshold))
+        thresholds = [float(np.clip(t, 0.0, 1.0)) for t in thresholds]
+
+        scales = _parse_int_list_v2ex(dino_scales, default_list=[800])
+        if 800 not in scales:
+            scales.append(800)
+        scales = [int(max(16, s)) for s in scales]
+
+        paddings = _parse_float_list_v2ex(box_paddings, default_list=[0.0, 0.08])
+        paddings = [float(max(0.0, p)) for p in paddings]
+
+        prompts_extra = [p for p in (prompt_variants.split("|") if prompt_variants else [])]
+
+        for item in image:
+            item = Image.fromarray(
+                np.clip(255.0 * item.cpu().numpy(), 0, 255).astype(np.uint8)
+            ).convert("RGBA")
+
+            # 1) Collect diverse DINO candidates
+            boxes_merged, scores_merged = _collect_dino_candidates_multi_v2ex(
+                grounding_dino_model, item, prompt, prompts_extra, thresholds, scales,
+                nms_iou=0.5, max_after_merge=max_candidates_after_merge
+            )
+
+            if boxes_merged.shape[0] == 0:
+                continue
+
+            # 2) Expand boxes with paddings to create more SAM inputs
+            W, H = item.size
+            boxes_padded, pad_index = _tile_boxes_with_paddings_v2ex(boxes_merged, paddings, W, H)
+
+            # Cap number of boxes fed to SAM
+            if boxes_padded.shape[0] > max_sam_boxes:
+                # Select by interleaving across paddings to keep diversity
+                idx = []
+                n = min(max_sam_boxes, boxes_padded.shape[0])
+                stride = max(1, boxes_padded.shape[0] // n)
+                for i in range(0, boxes_padded.shape[0], stride):
+                    idx.append(i)
+                    if len(idx) >= n:
+                        break
+                boxes_padded = boxes_padded[idx]
+
+            # 3) Blob detection points (defensive init)
+            point_coords = None
+            point_labels = None
+            positive_points = []
+            negative_points = []
+            if enable_blob_detection == "true":
+                img_np = np.array(item)[:, :, :3]  # RGB
+                hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
+                light_lower = np.array([light_hue_min / 2, light_sat_min * 255, light_val_min * 255])
+                light_upper = np.array([light_hue_max / 2, 255, 255])
+                light_mask = cv2.inRange(hsv, light_lower, light_upper)
+
+                dark_lower = np.array([dark_hue_min / 2, 0, 0])
+                dark_upper = np.array([dark_hue_max / 2, 255, dark_val_max * 255])
+                dark_mask = cv2.inRange(hsv, dark_lower, dark_upper)
+
+                kernel = np.ones((erosion_kernel, erosion_kernel), np.uint8)
+                light_mask = cv2.erode(light_mask, kernel, iterations=1)
+                light_mask = cv2.dilate(light_mask, kernel, iterations=1)
+                dark_mask = cv2.erode(dark_mask, kernel, iterations=1)
+                dark_mask = cv2.dilate(dark_mask, kernel, iterations=1)
+
+                if num_positive_points > 0:
+                    positive_points = get_centroids(light_mask, min_blob_size, num_positive_points)
+                if num_negative_points > 0:
+                    negative_points = get_centroids(dark_mask, min_blob_size, num_negative_points)
+
+                if len(positive_points) or len(negative_points):
+                    all_points = positive_points + negative_points
+                    point_coords = np.array(all_points)
+                    point_labels = np.array([1] * len(positive_points) + [0] * len(negative_points))
+
+            # 4) Preview image (we'll color later after filtering)
+            debug_img = np.array(item)[:, :, :3]  # RGB copy
+            debug_img_bgr = cv2.cvtColor(debug_img, cv2.COLOR_RGB2BGR)
+            boxes_int_all = boxes_padded.detach().cpu().numpy().astype(int)
+            for b in boxes_int_all:
+                x1,y1,x2,y2 = b
+                cv2.rectangle(debug_img_bgr, (x1,y1), (x2,y2), (255, 165, 0), 1)  # orange for "candidates"
+
+            # 5) Run SAM
+            predictor = SAM2ImagePredictor(sam_model)
+            image_np = np.array(item)
+            image_np_rgb = image_np[..., :3]
+            predictor.set_image(image_np_rgb)
+
+            boxes_np = boxes_padded.detach().cpu().numpy().astype(np.float32)
+            multimask_flag = (sam_multimask_output == "true")
+            masks, sam_scores, _ = predictor.predict(
+                point_coords=point_coords,
+                point_labels=point_labels,
+                box=boxes_np,
+                multimask_output=multimask_flag
+            )
+
+            masks_b, boxes_rep = _flatten_sam_masks_v2ex(masks, boxes_padded, multimask_flag)
+
+            # 6) Area-based filtering across proposals
+            keep_idx, ratios = _filter_masks_by_area_quantiles(
+                masks_bxhxw=masks_b, boxes_xyxy=boxes_rep,
+                low_q=area_low_q, high_q=area_high_q,
+                min_ratio=area_min_ratio, max_ratio=area_max_ratio
+            )
+
+            # Draw kept (green) and discarded (red) boxes for preview
+            keep_set = set(keep_idx)
+            # Since boxes_rep may be larger than boxes_padded (if multimask=True), we only draw per unique box
+            # Use the first occurrence of each box index
+            boxes_unique = boxes_padded.detach().cpu().numpy().astype(int)
+            used = set()
+            for i, b in enumerate(boxes_unique):
+                x1,y1,x2,y2 = b
+                if tuple(b) in used:
+                    continue
+                used.add(tuple(b))
+                # If any proposal for this box survived, mark as green; else red
+                # Map from proposals back to original box via integer division of i by M isn't trivial here;
+                # As an approximation: if any proposal index with same box coords survived -> green
+                # We'll check all proposals and compare coords
+                survived = False
+                for j in keep_idx:
+                    # j indexes into masks_b and boxes_rep
+                    bb = boxes_rep[j].detach().cpu().numpy().astype(int)
+                    if (bb == b).all():
+                        survived = True
+                        break
+                color = (0,255,0) if survived else (0,0,255)
+                cv2.rectangle(debug_img_bgr, (x1,y1), (x2,y2), color, 2)
+
+            if point_coords is not None:
+                for i, pt in enumerate(point_coords):
+                    color = (0, 255, 0) if point_labels[i] == 1 else (0, 0, 255)
+                    cv2.circle(debug_img_bgr, (int(pt[0]), int(pt[1])), 5, color, -1)
+
+            debug_img_rgb = cv2.cvtColor(debug_img_bgr, cv2.COLOR_BGR2RGB)
+            fn = f"{uuid.uuid4()}.png"
+            full_path = os.path.join(temp_path, fn)
+            Image.fromarray(debug_img_rgb).save(full_path)
+            previews.append({"filename": fn, "subfolder": "", "type": "temp"})
+
+            # 7) Build survivors stack (1, K, H, W) and create Comfy outputs
+            survivors = masks_b[keep_idx, :, :]
+            if survivors.ndim == 2:
+                survivors = survivors[None, ...]  # (1, H, W)
+            else:
+                survivors = survivors[None, ...]  # (1, K, H, W)
+            images_t, masks_t = create_tensor_output(image_np, [survivors], boxes_rep)
+            res_images.extend(images_t)
+            res_masks.extend(masks_t)
+
+        if len(res_images) == 0:
+            _, height, width, _ = image.shape
+            empty_mask = torch.zeros(
+                (1, height, width), dtype=torch.uint8, device="cpu"
+            )
+            return {"ui": {"images": []}, "result": (empty_mask, empty_mask)}
+        return {"ui": {"images": previews}, "result": (torch.cat(res_images, dim=0), torch.cat(res_masks, dim=0))}
+
+
+# Register new node without disturbing existing mapping if defined elsewhere
+try:
+    NODE_CLASS_MAPPINGS
+except NameError:
+    NODE_CLASS_MAPPINGS = {}
+try:
+    NODE_DISPLAY_NAME_MAPPINGS
+except NameError:
+    NODE_DISPLAY_NAME_MAPPINGS = {}
+
+NODE_CLASS_MAPPINGS.update({
+    "GroundingDinoSAM2SegmentV2Ex": GroundingDinoSAM2SegmentV2Ex,
+})
+
+NODE_DISPLAY_NAME_MAPPINGS.update({
+    "GroundingDinoSAM2SegmentV2Ex": "GroundingDINO + SAM2 Segment (V2Ex: multi-run + multimask)",
+})

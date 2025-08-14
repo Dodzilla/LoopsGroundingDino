@@ -8,3 +8,4 @@ iopath>=0.1.10
 pillow>=9.4.0
 matplotlib>=3.9.1
 opencv-python>=4.7.0
+torch

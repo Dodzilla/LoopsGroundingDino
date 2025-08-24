@@ -1,3 +1,4 @@
+
 import os
 import sys
 import uuid
@@ -306,25 +307,18 @@ def get_control_points(mask, min_size, max_num, min_sep=12, min_dt=0.5):
     return [[float(x), float(y)] for (x, y) in chosen]
 
 
-
-def sam_segment(sam_model, image, boxes, point_coords=None, point_labels=None):
-    if boxes.shape[0] == 0:
-        return None
-    predictor = SAM2ImagePredictor(sam_model)
-    image_np = np.array(image)
-    image_np_rgb = image_np[..., :3]
-    predictor.set_image(image_np_rgb)
-    sam_device = comfy.model_management.get_torch_device()
-    masks, scores, _ = predictor.predict(
-        point_coords=point_coords, point_labels=point_labels, box=boxes, multimask_output=False
-    )
-    print("scores: ", scores)
-    print("masks shape before any modification:", masks.shape)
-    if masks.ndim == 3:
-        masks = np.expand_dims(masks, axis=0)
-    print("masks shape after ensuring 4D:", masks.shape)
-    masks = np.transpose(masks, (1, 0, 2, 3))
-    return create_tensor_output(image_np, masks, boxes)
+def _ensure_3d_mask(m):
+    # normalize SAM outputs to (K, H, W) float/bool
+    if m.ndim == 2:
+        return m[None, :, :]
+    elif m.ndim == 3:
+        # either (K, H, W) or (1, H, W) already
+        return m
+    elif m.ndim == 4:
+        # (B, K, H, W) -> strip batch dim
+        return m[0, ...]
+    else:
+        raise ValueError(f"Unexpected mask ndim={m.ndim}")
 
 
 class SAM2ModelLoader:
@@ -404,6 +398,7 @@ class GroundingDinoSAM2Segment:
         res_masks = []
         previews = []
         temp_path = folder_paths.get_temp_directory()
+
         for item in image:
             item = Image.fromarray(
                 np.clip(255.0 * item.cpu().numpy(), 0, 255).astype(np.uint8)
@@ -416,30 +411,22 @@ class GroundingDinoSAM2Segment:
             if boxes.shape[0] > max_bounding_boxes:
                 boxes = boxes[:max_bounding_boxes]
 
-            point_coords = None
-            point_labels = None
-            if enable_blob_detection == "true":
-                img_np = np.array(item)[:, :, :3]  # RGB
-                hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
-                light_lower = np.array([light_hue_min / 2, light_sat_min * 255, light_val_min * 255])
-                light_upper = np.array([light_hue_max / 2, 255, 255])
-                light_mask = cv2.inRange(hsv, light_lower, light_upper)
-                dark_lower = np.array([dark_hue_min / 2, 0, 0])
-                dark_upper = np.array([dark_hue_max / 2, 255, dark_val_max * 255])
-                dark_mask = cv2.inRange(hsv, dark_lower, dark_upper)
-                kernel = np.ones((erosion_kernel, erosion_kernel), np.uint8)
-                light_mask = cv2.erode(light_mask, kernel, iterations=1)
-                light_mask = cv2.dilate(light_mask, kernel, iterations=1)
-                dark_mask = cv2.erode(dark_mask, kernel, iterations=1)
-                dark_mask = cv2.dilate(dark_mask, kernel, iterations=1)
-                if num_positive_points > 0:
-                    positive_points = get_control_points(light_mask, min_blob_size, num_positive_points)
-                if num_negative_points > 0:
-                    negative_points = get_control_points(dark_mask, min_blob_size, num_negative_points)
-                if positive_points or negative_points:
-                    all_points = positive_points + negative_points
-                    point_coords = np.array(all_points)
-                    point_labels = np.array([1] * len(positive_points) + [0] * len(negative_points))
+            # Prepare HSV & masks once (global), then crop per-box
+            img_np = np.array(item)[:, :, :3]  # RGB
+            hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
+            kernel = np.ones((erosion_kernel, erosion_kernel), np.uint8)
+
+            light_lower = np.array([light_hue_min / 2, light_sat_min * 255, light_val_min * 255])
+            light_upper = np.array([light_hue_max / 2, 255, 255])
+            light_mask_full = cv2.inRange(hsv, light_lower, light_upper)
+            light_mask_full = cv2.erode(light_mask_full, kernel, iterations=1)
+            light_mask_full = cv2.dilate(light_mask_full, kernel, iterations=1)
+
+            dark_lower = np.array([dark_hue_min / 2, 0, 0])
+            dark_upper = np.array([dark_hue_max / 2, 255, dark_val_max * 255])
+            dark_mask_full = cv2.inRange(hsv, dark_lower, dark_upper)
+            dark_mask_full = cv2.erode(dark_mask_full, kernel, iterations=1)
+            dark_mask_full = cv2.dilate(dark_mask_full, kernel, iterations=1)
 
             # Create preview image
             debug_img = np.array(item)[:, :, :3]  # RGB copy
@@ -448,19 +435,85 @@ class GroundingDinoSAM2Segment:
             for box in boxes_np:
                 x1, y1, x2, y2 = box
                 cv2.rectangle(debug_img_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)  # green box
-            if point_coords is not None:
-                for i, pt in enumerate(point_coords):
-                    color = (0, 255, 0) if point_labels[i] == 1 else (0, 0, 255)  # green pos, red neg
-                    cv2.circle(debug_img_bgr, (int(pt[0]), int(pt[1])), 5, color, -1)
+
+            # Run SAM2
+            predictor = SAM2ImagePredictor(sam_model)
+            image_np = np.array(item)
+            image_np_rgb = image_np[..., :3]
+            predictor.set_image(image_np_rgb)
+
+            per_box_masks = []
+            H, W = image_np_rgb.shape[:2]
+
+            for bi in range(boxes_np.shape[0]):
+                x1, y1, x2, y2 = [int(v) for v in boxes_np[bi]]
+                x1 = max(0, x1); y1 = max(0, y1)
+                x2 = min(W, x2); y2 = min(H, y2)
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                pc_i = None
+                pl_i = None
+
+                if enable_blob_detection == "true":
+                    # ROI masks
+                    lm = light_mask_full[y1:y2, x1:x2]
+                    dm = dark_mask_full[y1:y2, x1:x2]
+
+                    pos_pts_abs = []
+                    neg_pts_abs = []
+
+                    # --- positives: robust interior points inside the box ---
+                    if num_positive_points > 0:
+                        pos_pts_roi = get_control_points(lm, min_blob_size, num_positive_points, min_sep=max(12, 3*erosion_kernel))
+                        pos_pts_abs = [[x1 + float(px), y1 + float(py)] for (px, py) in pos_pts_roi]
+
+                    # --- negatives: confined inside the same box ---
+                    if num_negative_points > 0:
+                        # ring just outside positive region but still inside the box
+                        dil = cv2.dilate(lm, kernel, iterations=1)
+                        ring = cv2.subtract(dil, lm)
+                        # prefer ring ∩ dark
+                        ring_and_dark = cv2.bitwise_and(ring, dm)
+                        neg_pts_roi = get_control_points(ring_and_dark, 3, num_negative_points, min_sep=max(8, 2*erosion_kernel))
+                        # fallback to (dark AND not-light) if not enough
+                        if len(neg_pts_roi) < num_negative_points:
+                            dm_only = cv2.bitwise_and(dm, cv2.bitwise_not(lm))
+                            more = get_control_points(dm_only, min_blob_size, num_negative_points - len(neg_pts_roi), min_sep=max(8, 2*erosion_kernel))
+                            neg_pts_roi += more
+
+                        neg_pts_abs = [[x1 + float(nx), y1 + float(ny)] for (nx, ny) in neg_pts_roi]
+
+                    all_pts = pos_pts_abs + neg_pts_abs
+                    if all_pts:
+                        pc_i = np.array(all_pts, dtype=np.float32)
+                        pl_i = np.array([1] * len(pos_pts_abs) + [0] * len(neg_pts_abs), dtype=np.int64)
+
+                        # draw only the used points for this box
+                        for (x, y), lbl in zip(pc_i, pl_i):
+                            color = (0, 255, 0) if int(lbl) == 1 else (0, 0, 255)
+                            cv2.circle(debug_img_bgr, (int(x), int(y)), 5, color, -1)
+
+                masks_i, scores, _ = predictor.predict(
+                    point_coords=pc_i, point_labels=pl_i, box=np.array([[x1, y1, x2, y2]], dtype=np.float32), multimask_output=False
+                )
+
+                masks_i = _ensure_3d_mask(masks_i)  # (K, H, W)
+                per_box_masks.append(masks_i)
+
+            # Save preview
             debug_img_rgb = cv2.cvtColor(debug_img_bgr, cv2.COLOR_BGR2RGB)
             fn = f"{uuid.uuid4()}.png"
             full_path = os.path.join(temp_path, fn)
             Image.fromarray(debug_img_rgb).save(full_path)
             previews.append({"filename": fn, "subfolder": "", "type": "temp"})
 
-            (images, masks) = sam_segment(sam_model, item, boxes, point_coords, point_labels)
-            res_images.extend(images)
-            res_masks.extend(masks)
+            # Build outputs (one result per box)
+            if len(per_box_masks) > 0:
+                images, masks = create_tensor_output(image_np, per_box_masks, boxes)
+                res_images.extend(images)
+                res_masks.extend(masks)
+
         if len(res_images) == 0:
             _, height, width, _ = image.shape
             empty_mask = torch.zeros(

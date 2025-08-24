@@ -193,19 +193,6 @@ def split_image_mask(image):
         mask = torch.zeros((h, w), dtype=torch.float32, device="cpu")[None,]
     return (image_rgb, mask)
 
-def get_centroids(mask, min_size, max_num):
-    valid_centroids = []
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    if num_labels > 1:
-        areas = stats[1:, cv2.CC_STAT_AREA]
-        sorted_idx = np.argsort(-areas)
-        for idx in sorted_idx:
-            if areas[idx] >= min_size:
-                cx, cy = centroids[idx + 1]
-                valid_centroids.append([cx, cy])
-            if len(valid_centroids) >= max_num:
-                break
-    return valid_centroids
 
 # -----------------------------
 # V2 Node
@@ -260,6 +247,7 @@ class GroundingDinoSAM2SegmentV2:
              dark_hue_min, dark_hue_max, dark_val_max, min_blob_size, num_positive_points,
              num_negative_points, erosion_kernel):
 
+        from .node import get_control_points
         # Constants for conservative area filtering (middle quantile + absolute bounds)
         LOW_Q = 0.20
         HIGH_Q = 0.80
@@ -305,9 +293,9 @@ class GroundingDinoSAM2SegmentV2:
                 dark_mask = cv2.dilate(dark_mask, kernel, iterations=1)
 
                 if num_positive_points > 0:
-                    positive_points = get_centroids(light_mask, min_blob_size, num_positive_points)
+                    positive_points = get_control_points(light_mask, min_blob_size, num_positive_points)
                 if num_negative_points > 0:
-                    negative_points = get_centroids(dark_mask, min_blob_size, num_negative_points)
+                    negative_points = get_control_points(dark_mask, min_blob_size, num_negative_points)
 
                 if len(positive_points) or len(negative_points):
                     all_points = positive_points + negative_points
@@ -326,9 +314,29 @@ class GroundingDinoSAM2SegmentV2:
 
             # predictor expects numpy boxes (N,4); ensure float32
             boxes_np = boxes.detach().cpu().numpy().astype(np.float32)
+
+            # If both boxes and points are provided, tile points per box to match batch dim B
+            if point_coords is not None:
+                pc = np.asarray(point_coords)
+                pl = np.asarray(point_labels) if point_labels is not None else None
+                if pc.ndim == 2:
+                    pc = pc[None, ...]  # (1, N, 2)
+                if pl is not None and pl.ndim == 1:
+                    pl = pl[None, ...]  # (1, N)
+                B = boxes_np.shape[0]
+                if pc.shape[0] != B:
+                    pc = np.repeat(pc, B, axis=0)
+                    if pl is not None:
+                        pl = np.repeat(pl, B, axis=0)
+                point_coords_in = pc.astype(np.float32)
+                point_labels_in = pl.astype(np.int64) if pl is not None else None
+            else:
+                point_coords_in = None
+                point_labels_in = None
+
             masks, sam_scores, _ = predictor.predict(
-                point_coords=point_coords,
-                point_labels=point_labels,
+                point_coords=point_coords_in,
+                point_labels=point_labels_in,
                 box=boxes_np,
                 multimask_output=False
             )
@@ -590,6 +598,8 @@ class GroundingDinoSAM2SegmentV2Ex:
              dark_hue_min, dark_hue_max, dark_val_max, min_blob_size, num_positive_points,
              num_negative_points, erosion_kernel):
 
+        from .node import get_control_points
+
         res_images = []
         res_masks = []
         previews = []
@@ -664,9 +674,9 @@ class GroundingDinoSAM2SegmentV2Ex:
                 dark_mask = cv2.dilate(dark_mask, kernel, iterations=1)
 
                 if num_positive_points > 0:
-                    positive_points = get_centroids(light_mask, min_blob_size, num_positive_points)
+                    positive_points = get_control_points(light_mask, min_blob_size, num_positive_points)
                 if num_negative_points > 0:
-                    negative_points = get_centroids(dark_mask, min_blob_size, num_negative_points)
+                    negative_points = get_control_points(dark_mask, min_blob_size, num_negative_points)
 
                 if len(positive_points) or len(negative_points):
                     all_points = positive_points + negative_points
@@ -689,9 +699,28 @@ class GroundingDinoSAM2SegmentV2Ex:
 
             boxes_np = boxes_padded.detach().cpu().numpy().astype(np.float32)
             multimask_flag = (sam_multimask_output == "true")
+            # If both boxes and points are provided, tile points per box to match batch dim B
+            if point_coords is not None:
+                pc = np.asarray(point_coords)
+                pl = np.asarray(point_labels) if point_labels is not None else None
+                if pc.ndim == 2:
+                    pc = pc[None, ...]  # (1, N, 2)
+                if pl is not None and pl.ndim == 1:
+                    pl = pl[None, ...]  # (1, N)
+                B = boxes_np.shape[0]
+                if pc.shape[0] != B:
+                    pc = np.repeat(pc, B, axis=0)
+                    if pl is not None:
+                        pl = np.repeat(pl, B, axis=0)
+                point_coords_in = pc.astype(np.float32)
+                point_labels_in = pl.astype(np.int64) if pl is not None else None
+            else:
+                point_coords_in = None
+                point_labels_in = None
+
             masks, sam_scores, _ = predictor.predict(
-                point_coords=point_coords,
-                point_labels=point_labels,
+                point_coords=point_coords_in,
+                point_labels=point_labels_in,
                 box=boxes_np,
                 multimask_output=multimask_flag
             )

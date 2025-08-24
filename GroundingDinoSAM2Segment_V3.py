@@ -193,25 +193,11 @@ def split_image_mask(image):
         mask = torch.zeros((h, w), dtype=torch.float32, device="cpu")[None,]
     return (image_rgb, mask)
 
-def get_centroids(mask, min_size, max_num):
-    valid_centroids = []
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    if num_labels > 1:
-        areas = stats[1:, cv2.CC_STAT_AREA]
-        sorted_idx = np.argsort(-areas)
-        for idx in sorted_idx:
-            if areas[idx] >= min_size:
-                cx, cy = centroids[idx + 1]
-                valid_centroids.append([cx, cy])
-            if len(valid_centroids) >= max_num:
-                break
-    return valid_centroids
-
 # -----------------------------
 # V2 Node
 # -----------------------------
 
-class GroundingDinoSAM2SegmentV2:
+class GroundingDinoSAM2SegmentV3:
     """
     Conservative V2:
       - GroundingDINO: scores + NMS + top-K
@@ -260,6 +246,8 @@ class GroundingDinoSAM2SegmentV2:
              dark_hue_min, dark_hue_max, dark_val_max, min_blob_size, num_positive_points,
              num_negative_points, erosion_kernel):
 
+        from .node import get_control_points
+
         # Constants for conservative area filtering (middle quantile + absolute bounds)
         LOW_Q = 0.20
         HIGH_Q = 0.80
@@ -305,9 +293,9 @@ class GroundingDinoSAM2SegmentV2:
                 dark_mask = cv2.dilate(dark_mask, kernel, iterations=1)
 
                 if num_positive_points > 0:
-                    positive_points = get_centroids(light_mask, min_blob_size, num_positive_points)
+                    positive_points = get_control_points(light_mask, min_blob_size, num_positive_points)
                 if num_negative_points > 0:
-                    negative_points = get_centroids(dark_mask, min_blob_size, num_negative_points)
+                    negative_points = get_control_points(dark_mask, min_blob_size, num_negative_points)
 
                 if len(positive_points) or len(negative_points):
                     all_points = positive_points + negative_points
@@ -319,21 +307,48 @@ class GroundingDinoSAM2SegmentV2:
             debug_img_bgr = cv2.cvtColor(debug_img, cv2.COLOR_RGB2BGR)
 
             # Run SAM (one mask per box)
+
+            # Run SAM per box (filter points to those inside each box)
             predictor = SAM2ImagePredictor(sam_model)
             image_np = np.array(item)
             image_np_rgb = image_np[..., :3]
             predictor.set_image(image_np_rgb)
 
-            # predictor expects numpy boxes (N,4); ensure float32
             boxes_np = boxes.detach().cpu().numpy().astype(np.float32)
-            masks, sam_scores, _ = predictor.predict(
-                point_coords=point_coords,
-                point_labels=point_labels,
-                box=boxes_np,
-                multimask_output=False
-            )
 
-            # Normalize mask shape to (B, H, W)
+            per_box_masks = []
+            for bi in range(boxes_np.shape[0]):
+                b = boxes_np[bi]
+                # points inside this box only
+                pc_i = None
+                pl_i = None
+                if point_coords is not None:
+                    pc_all = np.asarray(point_coords, dtype=np.float32)
+                    pl_all = np.asarray(point_labels, dtype=np.int64) if point_labels is not None else None
+                    x1, y1, x2, y2 = [int(v) for v in b]
+                    inside = (pc_all[:, 0] >= x1) & (pc_all[:, 0] <= x2) & (pc_all[:, 1] >= y1) & (pc_all[:, 1] <= y2)
+                    if inside.any():
+                        pc_i = pc_all[inside]
+                        if pl_all is not None:
+                            pl_i = pl_all[inside]
+
+                masks_i, sam_scores, _ = predictor.predict(
+                    point_coords=pc_i,
+                    point_labels=pl_i,
+                    box=b[None, :],
+                    multimask_output=False
+                )
+                # Normalize to (H, W)
+                if masks_i.ndim == 2:
+                    per_box_masks.append(masks_i)
+                elif masks_i.ndim == 4:
+                    per_box_masks.append(masks_i[0, 0, :, :])
+                elif masks_i.ndim == 3:
+                    per_box_masks.append(masks_i[0, :, :])
+                else:
+                    raise ValueError(f"SAM returned unexpected ndim={masks_i.ndim}")
+            masks = np.stack(per_box_masks, axis=0)
+# Normalize mask shape to (B, H, W)
             if masks.ndim == 2:
                 masks = masks[None, ...]
             elif masks.ndim == 4:
@@ -374,11 +389,9 @@ class GroundingDinoSAM2SegmentV2:
             res_masks.extend(masks_t)
 
         if len(res_images) == 0:
-            # Produce an empty mask with the same spatial size as input
             _, height, width, _ = image.shape
-            empty_mask = torch.zeros(
-                (1, height, width), dtype=torch.uint8, device="cpu"
-            )
-            return {"ui": {"images": []}, "result": (empty_mask, empty_mask)}
+            empty_img = torch.zeros((1, height, width, 3), dtype=torch.float32, device="cpu")
+            empty_mask = torch.zeros((1, height, width), dtype=torch.float32, device="cpu")
+            return {"ui": {"images": []}, "result": (empty_img, empty_mask)}
         return {"ui": {"images": previews}, "result": (torch.cat(res_images, dim=0), torch.cat(res_masks, dim=0))}
 

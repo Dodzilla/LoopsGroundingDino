@@ -241,19 +241,70 @@ def split_image_mask(image):
     return (image_rgb, mask)
 
 
-def get_centroids(mask, min_size, max_num):
-    valid_centroids = []
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    if num_labels > 1:
-        areas = stats[1:, cv2.CC_STAT_AREA]
-        sorted_idx = np.argsort(-areas)
-        for idx in sorted_idx:
-            if areas[idx] >= min_size:
-                cx, cy = centroids[idx + 1]
-                valid_centroids.append([cx, cy])
-            if len(valid_centroids) >= max_num:
+def get_control_points(mask, min_size, max_num, min_sep=12, min_dt=0.5):
+    """
+    Robust interior-point picker:
+      - Works per connected component (8-connectivity)
+      - Uses distance transform local maxima inside each component
+      - Greedy NMS enforces min separation (min_sep px)
+    Returns: list[[x, y], ...] in image coords
+    """
+    mask_u8 = (mask > 0).astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+
+    candidates = []  # (dt_value, x, y)
+    for lbl in range(1, num_labels):
+        area = stats[lbl, cv2.CC_STAT_AREA]
+        if area < min_size:
+            continue
+
+        comp = (labels == lbl).astype(np.uint8)
+        # Distance to the nearest background pixel (L2)
+        dt = cv2.distanceTransform(comp, cv2.DIST_L2, 5)
+
+        # Local maxima via morphological dilation
+        # kernel size ~ 2 * min_sep + 1 to reflect desired separation
+        k = max(3, 2 * int(min_sep) + 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+        dt_dil = cv2.dilate(dt, kernel)
+
+        # Accept positions that are (near) the local max and have enough in-mask distance
+        maxima = (dt >= (dt_dil - 1e-6)) & (dt >= float(min_dt))
+        ys, xs = np.where(maxima)
+        vals = dt[ys, xs]
+
+        # Collect candidates (sorted later, global NMS after merging components)
+        for x, y, v in zip(xs, ys, vals):
+            candidates.append((float(v), int(x), int(y)))
+
+        # Fallback for super-thin shapes where no maxima survive:
+        if len(xs) == 0:
+            # Pick the farthest in-mask pixel anyway
+            yx = np.unravel_index(np.argmax(dt), dt.shape)
+            y, x = int(yx[0]), int(yx[1])
+            candidates.append((float(dt[y, x]), x, y))
+
+    # Sort by distance (prefer points deep inside)
+    candidates.sort(key=lambda t: -t[0])
+
+    # Greedy NMS: enforce a minimum pairwise separation
+    chosen = []
+    min_sep2 = float(min_sep) * float(min_sep)
+    for _, x, y in candidates:
+        ok = True
+        for cx, cy in chosen:
+            dx = x - cx
+            dy = y - cy
+            if dx * dx + dy * dy < min_sep2:
+                ok = False
                 break
-    return valid_centroids
+        if ok:
+            chosen.append((x, y))
+            if len(chosen) >= max_num:
+                break
+
+    return [[float(x), float(y)] for (x, y) in chosen]
+
 
 
 def sam_segment(sam_model, image, boxes, point_coords=None, point_labels=None):
@@ -382,9 +433,9 @@ class GroundingDinoSAM2Segment:
                 dark_mask = cv2.erode(dark_mask, kernel, iterations=1)
                 dark_mask = cv2.dilate(dark_mask, kernel, iterations=1)
                 if num_positive_points > 0:
-                    positive_points = get_centroids(light_mask, min_blob_size, num_positive_points)
+                    positive_points = get_control_points(light_mask, min_blob_size, num_positive_points)
                 if num_negative_points > 0:
-                    negative_points = get_centroids(dark_mask, min_blob_size, num_negative_points)
+                    negative_points = get_control_points(dark_mask, min_blob_size, num_negative_points)
                 if positive_points or negative_points:
                     all_points = positive_points + negative_points
                     point_coords = np.array(all_points)

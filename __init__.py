@@ -1,7 +1,7 @@
 from .GroundingDinoSAM2SegmentV2 import GroundingDinoSAM2SegmentV2, GroundingDinoSAM2SegmentV2Ex
 from .GroundingDinoSAM2Segment_V3 import GroundingDinoSAM2SegmentV3
 from .node import SAM2ModelLoader, GroundingDinoModelLoader, GroundingDinoSAM2Segment, InvertMask, IsMaskEmptyNode
-deom .node_v2 import GroundingDinoSAM2SegmentV2
+from .node_v2 import GroundingDinoSAM2SegmentV2
 
 NODE_CLASS_MAPPINGS = {
     'SAM2ModelLoader (segment anything2)': SAM2ModelLoader,

@@ -518,6 +518,9 @@ class GroundingDinoSAM2SegmentV2:
         res_masks = []
         previews = []
         temp_path = folder_paths.get_temp_directory()
+        
+        # Create predictor once outside loop to prevent memory accumulation
+        predictor = SAM2ImagePredictor(sam_model)
 
         for item in image:
             item = Image.fromarray(
@@ -570,7 +573,6 @@ class GroundingDinoSAM2SegmentV2:
                 x1, y1, x2, y2 = box
                 cv2.rectangle(debug_img_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-            predictor = SAM2ImagePredictor(sam_model)
             image_np = np.array(item)
             image_np_rgb = image_np[..., :3]
 
@@ -650,13 +652,17 @@ class GroundingDinoSAM2SegmentV2:
                     logger.error(f"SAM predict OOM/RuntimeError: {re}")
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
-                    # try once more with fewer points
+                    # try once more with fewer points or box-only if insufficient points
                     try:
                         fewer_pc = None
                         fewer_pl = None
                         if pc_i is not None and pc_i.shape[0] > 4:
                             fewer_pc = pc_i[:4, :]
                             fewer_pl = pl_i[:4]
+                        elif pc_i is not None and pc_i.shape[0] > 0:
+                            fewer_pc = pc_i
+                            fewer_pl = pl_i
+                        # If no valid points, use box-only prediction
                         masks_i, scores, _ = predictor.predict(
                             point_coords=fewer_pc, point_labels=fewer_pl,
                             box=np.array([[x1, y1, x2, y2]], dtype=np.float32),
@@ -724,8 +730,17 @@ class GroundingDinoSAM2SegmentV2:
                     )
                     if extra_pts_roi:
                         extra_abs = [[x1 + float(px), y1 + float(py)] for (px, py) in extra_pts_roi]
-                        pc2 = np.array(extra_abs, dtype=np.float32) if pc_i is None else np.concatenate([pc_i, np.array(extra_abs, dtype=np.float32)], axis=0)
-                        pl2 = np.ones(len(extra_pts_roi), dtype=np.int64) if pl_i is None else np.concatenate([pl_i, np.ones(len(extra_pts_roi), dtype=np.int64)], axis=0)
+                        # Limit total points to prevent memory issues
+                        MAX_TOTAL_POINTS = 50
+                        if pc_i is not None and pc_i.shape[0] + len(extra_abs) > MAX_TOTAL_POINTS:
+                            max_extra = MAX_TOTAL_POINTS - pc_i.shape[0]
+                            extra_abs = extra_abs[:max(0, max_extra)]
+                        
+                        if extra_abs:  # Only proceed if we have valid extra points
+                            pc2 = np.array(extra_abs, dtype=np.float32) if pc_i is None else np.concatenate([pc_i, np.array(extra_abs, dtype=np.float32)], axis=0)
+                            pl2 = np.ones(len(extra_abs), dtype=np.int64) if pl_i is None else np.concatenate([pl_i, np.ones(len(extra_abs), dtype=np.int64)], axis=0)
+                        else:
+                            continue  # Skip this refinement if no valid extra points
                         try:
                             m3, s3, _ = predictor.predict(
                                 point_coords=pc2, point_labels=pl2,
@@ -763,6 +778,12 @@ class GroundingDinoSAM2SegmentV2:
                 images, masks = create_tensor_output(image_np, per_box_masks, boxes)
                 res_images.extend(images)
                 res_masks.extend(masks)
+            
+            # Cleanup after each image to prevent memory accumulation
+            try:
+                predictor.reset_predictor()
+            except:
+                pass
 
         if len(res_images) == 0:
             _, height, width, _ = image.shape

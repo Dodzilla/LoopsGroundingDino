@@ -427,178 +427,168 @@ class GroundingDinoSAM2SegmentV2:
     FUNCTION = "main"
     RETURN_TYPES = ("IMAGE", "MASK")
 
-    def main(self, grounding_dino_model, sam_model, image, prompt, threshold, max_bounding_boxes,
-             enable_blob_detection, light_hue_min, light_hue_max, light_sat_min, light_val_min,
-             dark_hue_min, dark_hue_max, dark_val_max, hue_gap, min_blob_size,
-             num_positive_points, num_negative_points, erosion_kernel):
-        res_images = []
-        res_masks = []
-        previews = []
-        temp_path = folder_paths.get_temp_directory()
+def main(self, grounding_dino_model, sam_model, image, prompt, threshold, max_bounding_boxes,
+         enable_blob_detection, light_hue_min, light_hue_max, light_sat_min, light_val_min,
+         dark_hue_min, dark_hue_max, dark_val_max, hue_gap, min_blob_size,
+         num_positive_points, num_negative_points, erosion_kernel):
 
-        for item in image:
-            # Convert tensor image to PIL RGBA
-            item = Image.fromarray(np.clip(255.0 * item.cpu().numpy(), 0, 255).astype(np.uint8)).convert("RGBA")
-            boxes = groundingdino_predict(grounding_dino_model, item, prompt, threshold)
-            if boxes.shape[0] == 0:
+    res_images, res_masks, previews = [], [], []
+    temp_path = folder_paths.get_temp_directory()
+
+    for item in image:
+        # ---- tensor -> PIL ----
+        item = Image.fromarray(
+            np.clip(255.0 * item.cpu().numpy(), 0, 255).astype(np.uint8)
+        ).convert("RGBA")
+
+        # ---- GroundingDINO (boxes) ----
+        boxes = groundingdino_predict(grounding_dino_model, item, prompt, threshold)
+        if boxes.shape[0] == 0:
+            continue
+        if boxes.shape[0] > max_bounding_boxes:
+            boxes = boxes[:max_bounding_boxes]
+
+        # ---- Prepare buffers (keep BOTH RGBA and RGB) ----
+        image_np_rgba = np.array(item)           # 4ch (needed for create_tensor_output)
+        image_np_rgb  = image_np_rgba[..., :3]   # 3ch (for HSV + SAM)
+        H_img, W_img  = image_np_rgb.shape[:2]
+
+        # ---- Resolution-aware morphology ----
+        import math
+        scale_factor = math.sqrt((H_img * W_img) / float(512 * 512))
+        k = max(1, int(round(erosion_kernel * scale_factor)))
+        kernel = np.ones((k, k), np.uint8)
+        area_ratio = (H_img * W_img) / float(512 * 512)
+        scaled_min_blob = max(10, int(min_blob_size * area_ratio))
+
+        # ---- HSV masks (positive croc hues, negative = inverse hues with a gap) ----
+        hsv = cv2.cvtColor(image_np_rgb, cv2.COLOR_RGB2HSV)
+
+        # positive (croc color band)
+        light_lower = np.array([light_hue_min / 2.0, light_sat_min * 255.0, light_val_min * 255.0])
+        light_upper = np.array([light_hue_max / 2.0, 255.0, 255.0])
+        light_mask_full = cv2.inRange(hsv, light_lower, light_upper)
+        light_mask_full = cv2.erode(light_mask_full, kernel, iterations=1)
+        light_mask_full = cv2.dilate(light_mask_full, kernel, iterations=1)
+
+        # negative = hues outside [light_hue_min - hue_gap, light_hue_max + hue_gap]
+        gap_min = max(0.0, light_hue_min - hue_gap)
+        gap_max = min(360.0, light_hue_max + hue_gap)
+
+        mask_neg1 = None
+        mask_neg2 = None
+        if gap_min > 0:
+            lower1 = np.array([0.0, 0.0, 0.0])
+            upper1 = np.array([(gap_min - 1e-6) / 2.0, 255.0, 255.0])    # allow any V (not just dark)
+            mask_neg1 = cv2.inRange(hsv, lower1, upper1)
+        if gap_max < 360:
+            lower2 = np.array([(gap_max + 1e-6) / 2.0, 0.0, 0.0])
+            upper2 = np.array([180.0, 255.0, 255.0])
+            mask_neg2 = cv2.inRange(hsv, lower2, upper2)
+        if mask_neg1 is not None and mask_neg2 is not None:
+            dark_mask_full = cv2.bitwise_or(mask_neg1, mask_neg2)
+        elif mask_neg1 is not None:
+            dark_mask_full = mask_neg1
+        elif mask_neg2 is not None:
+            dark_mask_full = mask_neg2
+        else:
+            dark_mask_full = np.zeros_like(light_mask_full)
+
+        # small refine on negatives (keeps edges clean)
+        dark_mask_full = cv2.erode(dark_mask_full, kernel, iterations=1)
+        dark_mask_full = cv2.dilate(dark_mask_full, kernel, iterations=1)
+
+        # ---- Debug preview canvas ----
+        debug_img_bgr = cv2.cvtColor(image_np_rgb.copy(), cv2.COLOR_RGB2BGR)
+        boxes_np = boxes.numpy().astype(int)
+        for x1, y1, x2, y2 in boxes_np:
+            cv2.rectangle(debug_img_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        # ---- SAM2 ----
+        predictor = SAM2ImagePredictor(sam_model)
+        predictor.set_image(image_np_rgb)
+
+        per_box_masks = []
+        for x1, y1, x2, y2 in boxes_np:
+            # clamp
+            x1 = max(0, x1); y1 = max(0, y1)
+            x2 = min(W_img, x2); y2 = min(H_img, y2)
+            if x2 <= x1 or y2 <= y1:
                 continue
-            # Limit number of bounding boxes as specified
-            if boxes.shape[0] > max_bounding_boxes:
-                boxes = boxes[:max_bounding_boxes]
 
-            # Prepare HSV image and morphological kernel (once globally for the image)
-            img_np = np.array(item)[:, :, :3]  # RGB image array
-            hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
-            H_img, W_img = img_np.shape[0], img_np.shape[1]
-            # **UPGRADE 3:** Adjust kernel and blob parameters based on image resolution for scalability
-            scale_factor = math.sqrt((H_img * W_img) / float(512*512))
-            # Scale the erosion/dilation kernel size
-            adj_kernel = max(1, int(round(erosion_kernel * scale_factor)))
-            kernel = np.ones((adj_kernel, adj_kernel), np.uint8)
-            # Scale min_blob_size to maintain relative size filter across resolutions
-            area_ratio = (H_img * W_img) / float(512*512)
-            scaled_min_blob = max(10, int(min_blob_size * area_ratio))
+            pc_i = pl_i = None
+            if enable_blob_detection == "true":
+                roi_light = light_mask_full[y1:y2, x1:x2]
+                roi_dark  = dark_mask_full[y1:y2, x1:x2]
 
-            # Define color range masks for croc vs non-croc
-            # Positive (croc) mask: green to light-yellow greens in hue [light_hue_min, light_hue_max] 
-            light_lower = np.array([light_hue_min / 2.0, light_sat_min * 255, light_val_min * 255], dtype=np.float32)
-            light_upper = np.array([light_hue_max / 2.0, 255, 255], dtype=np.float32)
-            light_mask_full = cv2.inRange(hsv, light_lower, light_upper)
-            # Morphological refine on light mask
-            light_mask_full = cv2.erode(light_mask_full, kernel, iterations=1)
-            light_mask_full = cv2.dilate(light_mask_full, kernel, iterations=1)
+                pos_pts_abs, neg_pts_abs = [], []
 
-            # Negative (non-croc) mask: invert the croc hue range with a gap on each side
-            # Compute gap-adjusted hue boundaries (ensuring a gap of at least `hue_gap` degrees)
-            gap_min = max(0.0, light_hue_min - hue_gap)
-            gap_max = min(360.0, light_hue_max + hue_gap)
-            # Create two masks for hues outside [gap_min, gap_max]
-            mask_neg1 = None
-            mask_neg2 = None
-            if gap_min > 0:
-                # Range 0 to gap_min (exclusive of gap_min)
-                lower1 = np.array([0, 0, 0], dtype=np.float32)
-                upper1 = np.array([max(0, (gap_min - 1e-6) / 2.0), 255, dark_val_max * 255], dtype=np.float32)
-                mask_neg1 = cv2.inRange(hsv, lower1, upper1)
-            if gap_max < 360:
-                # Range gap_max to 360
-                lower2 = np.array([min(180.0, (gap_max + 1e-6) / 2.0), 0, 0], dtype=np.float32)
-                upper2 = np.array([180.0, 255, dark_val_max * 255], dtype=np.float32)
-                mask_neg2 = cv2.inRange(hsv, lower2, upper2)
-            if mask_neg1 is not None and mask_neg2 is not None:
-                dark_mask_full = cv2.bitwise_or(mask_neg1, mask_neg2)
-            elif mask_neg1 is not None:
-                dark_mask_full = mask_neg1
-            elif mask_neg2 is not None:
-                dark_mask_full = mask_neg2
-            else:
-                # If gap covers full 0-360 (unlikely unless light range is full spectrum), no negative mask
-                dark_mask_full = np.zeros_like(light_mask_full)
-            # Morphological refine on dark mask
-            dark_mask_full = cv2.erode(dark_mask_full, kernel, iterations=1)
-            dark_mask_full = cv2.dilate(dark_mask_full, kernel, iterations=1)
+                # POSITIVES — widely spread (component-wise) and scaled separation
+                if num_positive_points > 0:
+                    pos_pts_roi = get_control_points(
+                        roi_light,
+                        scaled_min_blob,
+                        num_positive_points,
+                        min_sep=max(12, int(round(3 * scale_factor * erosion_kernel)))
+                    )
+                    pos_pts_abs = [[x1 + float(px), y1 + float(py)] for (px, py) in pos_pts_roi]
 
-            # Create a debug preview image with detected box and points (for UI)
-            debug_img = np.array(item)[:, :, :3].copy()  # RGB copy for drawing
-            debug_img_bgr = cv2.cvtColor(debug_img, cv2.COLOR_RGB2BGR)
-            boxes_np = boxes.numpy().astype(int)
-            for box in boxes_np:
-                x1, y1, x2, y2 = box
-                cv2.rectangle(debug_img_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)  # draw bounding box in green
+                # NEGATIVES — inverse hues near the croc edges
+                if num_negative_points > 0:
+                    # ring around positives within ROI
+                    dil = cv2.dilate(roi_light, kernel, iterations=1)
+                    ring = cv2.subtract(dil, roi_light)
+                    ring_and_dark = cv2.bitwise_and(ring, roi_dark)
+                    neg_pts_roi = []
+                    if np.count_nonzero(ring_and_dark) > 0:
+                        neg_pts_roi = get_control_points(
+                            ring_and_dark, 3, num_negative_points,
+                            min_sep=max(8, int(round(2 * scale_factor * erosion_kernel)))
+                        )
+                    # fallback: anywhere in inverse hue (but not croc hue)
+                    if len(neg_pts_roi) < num_negative_points and np.count_nonzero(roi_dark) > 0:
+                        more = get_control_points(
+                            cv2.bitwise_and(roi_dark, cv2.bitwise_not(roi_light)),
+                            scaled_min_blob, num_negative_points - len(neg_pts_roi),
+                            min_sep=max(8, int(round(2 * scale_factor * erosion_kernel)))
+                        )
+                        neg_pts_roi += more
 
-            # Initialize SAM predictor on the full image
-            predictor = SAM2ImagePredictor(sam_model)
-            image_np_rgb = img_np  # already got RGB array
-            predictor.set_image(image_np_rgb)
+                    neg_pts_abs = [[x1 + float(nx), y1 + float(ny)] for (nx, ny) in neg_pts_roi]
 
-            per_box_masks = []
-            H_img, W_img = image_np_rgb.shape[:2]
-            # Process each detected bounding box (each target region)
-            for (x1, y1, x2, y2) in boxes_np:
-                # Clamp box coordinates to image bounds
-                x1 = max(0, x1); y1 = max(0, y1)
-                x2 = min(W_img, x2); y2 = min(H_img, y2)
-                if x2 <= x1 or y2 <= y1:
-                    continue
+                all_pts = pos_pts_abs + neg_pts_abs
+                if all_pts:
+                    pc_i = np.array(all_pts, dtype=np.float32)
+                    pl_i = np.array([1] * len(pos_pts_abs) + [0] * len(neg_pts_abs), dtype=np.int64)
+                    for (x, y), lbl in zip(pc_i, pl_i):
+                        cv2.circle(debug_img_bgr, (int(x), int(y)), 5,
+                                   (0, 255, 0) if int(lbl) == 1 else (0, 0, 255), -1)
 
-                point_coords = None
-                point_labels = None
-                if enable_blob_detection == "true":
-                    # Focus masks to the current ROI (Region of Interest)
-                    roi_light = light_mask_full[y1:y2, x1:x2]
-                    roi_dark = dark_mask_full[y1:y2, x1:x2]
+            masks_i, scores, _ = predictor.predict(
+                point_coords=pc_i, point_labels=pl_i,
+                box=np.array([[x1, y1, x2, y2]], dtype=np.float32),
+                multimask_output=False
+            )
+            masks_i = _ensure_3d_mask(masks_i)  # (K,H,W)
+            per_box_masks.append(masks_i)
 
-                    pos_points = []
-                    neg_points = []
+        # ---- save preview ----
+        debug_img_rgb = cv2.cvtColor(debug_img_bgr, cv2.COLOR_BGR2RGB)
+        fn = f"{uuid.uuid4()}.png"
+        Image.fromarray(debug_img_rgb).save(os.path.join(temp_path, fn))
+        previews.append({"filename": fn, "subfolder": "", "type": "temp"})
 
-                    # **UPGRADE 1 & 2:** Get robust positive points widely spread across croc segments
-                    if num_positive_points > 0:
-                        pos_points_rel = get_control_points(roi_light, scaled_min_blob, num_positive_points,
-                                                            min_sep=max(12, int(round(3 * scale_factor * erosion_kernel))))
-                        # Convert ROI-relative coordinates to absolute image coordinates
-                        pos_points = [[x1 + px, y1 + py] for (px, py) in pos_points_rel]
+        # ---- build outputs (IMPORTANT: pass RGBA) ----
+        if per_box_masks:
+            images_out, masks_out = create_tensor_output(image_np_rgba, per_box_masks, boxes)  # <- fixed
+            res_images.extend(images_out)
+            res_masks.extend(masks_out)
 
-                    # **UPGRADE 2:** Determine negative points by focusing on non-croc hues around croc regions
-                    if num_negative_points > 0:
-                        # Create a ring around the positive mask within the box
-                        dilated_light = cv2.dilate(roi_light, kernel, iterations=1)
-                        ring = cv2.subtract(dilated_light, roi_light)
-                        # Prefer negative points in the ring that also fall in the non-croc color mask (dark areas)
-                        ring_dark = cv2.bitwise_and(ring, roi_dark)
-                        neg_points_rel = []
-                        if np.count_nonzero(ring_dark) > 0:
-                            neg_points_rel = get_control_points(ring_dark, 3, num_negative_points,
-                                                               min_sep=max(8, int(round(2 * scale_factor * erosion_kernel))))
-                        # If not enough negatives found in the ring, sample dark mask regions inside ROI (excluding croc color)
-                        if len(neg_points_rel) < num_negative_points:
-                            # Consider remaining negatives in any non-croc colored region within ROI
-                            remaining_neg_needed = num_negative_points - len(neg_points_rel)
-                            dark_only = cv2.bitwise_and(roi_dark, cv2.bitwise_not(roi_light))
-                            if np.count_nonzero(dark_only) > 0:
-                                more_neg = get_control_points(dark_only, scaled_min_blob, remaining_neg_needed,
-                                                              min_sep=max(8, int(round(2 * scale_factor * erosion_kernel))))
-                                neg_points_rel += more_neg
-                        # Convert negative points to absolute coordinates
-                        neg_points = [[x1 + nx, y1 + ny] for (nx, ny) in neg_points_rel]
+    if len(res_images) == 0:
+        _, height, width, _ = image.shape
+        empty_mask = torch.zeros((1, height, width), dtype=torch.uint8, device="cpu")
+        return {"ui": {"images": []}, "result": (empty_mask, empty_mask)}
 
-                    # Combine positive and negative point prompts for SAM
-                    all_points = pos_points + neg_points
-                    if all_points:
-                        point_coords = np.array(all_points, dtype=np.float32)
-                        point_labels = np.array([1]*len(pos_points) + [0]*len(neg_points), dtype=np.int64)
-                        # Draw the used control points on debug preview (green = positive, red = negative)
-                        for (px, py), lbl in zip(all_points, point_labels):
-                            color = (0, 255, 0) if lbl == 1 else (0, 0, 255)
-                            cv2.circle(debug_img_bgr, (int(px), int(py)), 5, color, -1)
+    return {"ui": {"images": previews}, "result": (torch.cat(res_images, dim=0), torch.cat(res_masks, dim=0))}
 
-                # Run SAM prediction with the prepared point prompts and box
-                masks, scores, _ = predictor.predict(
-                    point_coords=point_coords,
-                    point_labels=point_labels,
-                    box=np.array([[x1, y1, x2, y2]], dtype=np.float32),
-                    multimask_output=False
-                )
-                masks = _ensure_3d_mask(masks)  # normalize mask shape to (K, H, W)
-                per_box_masks.append(masks)
-
-            # Save debug preview image
-            debug_img_rgb = cv2.cvtColor(debug_img_bgr, cv2.COLOR_BGR2RGB)
-            filename = f"{uuid.uuid4()}.png"
-            full_path = os.path.join(temp_path, filename)
-            Image.fromarray(debug_img_rgb).save(full_path)
-            previews.append({"filename": filename, "subfolder": "", "type": "temp"})
-
-            # Collect output image tensor(s) and mask tensor(s) for each detected box
-            if per_box_masks:
-                images_out, masks_out = create_tensor_output(img_np, per_box_masks, boxes)
-                res_images.extend(images_out)
-                res_masks.extend(masks_out)
-
-        # If no segments were produced, return an empty mask
-        if len(res_images) == 0:
-            _, h, w, _ = image.shape
-            empty_mask = torch.zeros((1, h, w), dtype=torch.uint8, device="cpu")
-            return {"ui": {"images": []}, "result": (empty_mask, empty_mask)}
-
-        return {"ui": {"images": previews}, "result": (torch.cat(res_images, dim=0), torch.cat(res_masks, dim=0))}
 

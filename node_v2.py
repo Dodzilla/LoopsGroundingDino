@@ -245,6 +245,8 @@ def split_image_mask(image):
     return (image_rgb, mask)
 
 
+# ---------- Control point utilities ----------
+
 def get_control_points(mask, min_size, max_num, min_sep=12, min_dt=0.5, enforce_coverage=True):
     """
     Robust interior-point picker (component-aware).
@@ -341,6 +343,88 @@ def get_control_points(mask, min_size, max_num, min_sep=12, min_dt=0.5, enforce_
     return [[float(x), float(y)] for (x, y, _) in chosen]
 
 
+# ---- Scored negative point selection helpers ----
+
+def _angular_dist_to_band_deg(H_deg, band_min_deg, band_max_deg):
+    """
+    Minimal circular (0..360) distance in degrees from each hue H to the closed band [min,max].
+    Vectorized for numpy arrays.
+    """
+    # Ensure arrays
+    H = np.asarray(H_deg, dtype=np.float32)
+    a = float(band_min_deg)
+    b = float(band_max_deg)
+    # inside-band mask
+    inside = (H >= a) & (H <= b)
+    # distance to nearest edge (wrap-around)
+    d_low  = (a - H) % 360.0
+    d_high = (H - b) % 360.0
+    dist = np.minimum(d_low, d_high)
+    dist[inside] = 0.0
+    return dist
+
+
+def _nms_pick_topk(score_map_f32, k, min_sep_px):
+    """
+    Greedy NMS picker on a float32 score map.
+    Returns list of (x, y) coordinates (float).
+    """
+    pts = []
+    if k <= 0:
+        return pts
+    s = score_map_f32.copy()
+    s[s < 0] = 0.0
+    if s.max() <= 0:
+        return pts
+    r = max(1, int(min_sep_px))
+    for _ in range(k):
+        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(s)
+        if max_val <= 1e-8:
+            break
+        x, y = int(max_loc[0]), int(max_loc[1])
+        pts.append((float(x), float(y)))
+        # Suppress a disk around the chosen point
+        cv2.circle(s, (x, y), r, 0.0, -1)
+    return pts
+
+
+def pick_negative_points_scored(hsv_roi, lm_roi, dm_roi, k, band_min_deg, band_max_deg, min_sep_px, safe_erode=1):
+    """
+    Choose up to k negative points using a score that prefers:
+      - hues far from the croc band,
+      - pixels farther from the croc-color mask.
+    """
+    if k <= 0:
+        return []
+
+    # HSV channels (OpenCV H in [0..180]); convert H to degrees [0..360)
+    H = hsv_roi[..., 0].astype(np.float32) * 2.0
+    # Candidate region: inverse hue minus positive mask
+    cand = (dm_roi > 0).astype(np.uint8)
+    # Soft safety buffer around positive mask
+    if safe_erode > 0:
+        lm_dil = cv2.dilate((lm_roi > 0).astype(np.uint8), np.ones((safe_erode, safe_erode), np.uint8), iterations=1)
+        cand = cv2.bitwise_and(cand, cv2.bitwise_not(lm_dil))
+
+    # Distance-from-band (bigger = farther from croc hues)
+    hue_dist = _angular_dist_to_band_deg(H, band_min_deg, band_max_deg)  # degrees
+    hue_dist_norm = (hue_dist / 180.0).astype(np.float32)
+
+    # Distance-from-croc-mask (within ROI)
+    inv_lm = (lm_roi == 0).astype(np.uint8)
+    dt = cv2.distanceTransform(inv_lm, cv2.DIST_L2, 5).astype(np.float32)
+    if dt.max() > 0:
+        dt /= dt.max()
+    # Compose score (weights: hue dominates)
+    score = 0.75 * hue_dist_norm + 0.25 * dt
+    # Zero out non-candidates
+    score[cand == 0] = 0.0
+
+    # Pick top-k with NMS
+    pts = _nms_pick_topk(score, k, min_sep_px)
+    return pts
+
+
 def _ensure_3d_mask(m):
     # normalize SAM outputs to (K, H, W) float/bool
     if m.ndim == 2:
@@ -407,19 +491,18 @@ class GroundingDinoSAM2SegmentV2:
                     {"default": 1, "min": 1, "max": 10, "step": 1},
                 ),
                 "enable_blob_detection": (["true", "false"], {"default": "false"}),
-                # Positive (croc) color band
+                # Positive (croc) band — covers greens + yellow/olive belly
                 "light_hue_min": ("FLOAT", {"default": 25.0, "min": 0.0, "max": 360.0, "step": 1.0}),
                 "light_hue_max": ("FLOAT", {"default": 150.0, "min": 0.0, "max": 360.0, "step": 1.0}),
                 "light_sat_min": ("FLOAT", {"default": 0.12, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "light_val_min": ("FLOAT", {"default": 0.08, "min": 0.0, "max": 1.0, "step": 0.01}),
-                # Negatives:
-                # If (dark_hue_max - dark_hue_min) < 2.0 degrees, we use inverse-of-positive with 12° gap.
+                # If dark_hue_max - dark_hue_min < 2°, we auto-use inverse-of-positive with a small gap
                 "dark_hue_min": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 360.0, "step": 1.0}),
                 "dark_hue_max": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 360.0, "step": 1.0}),
                 "dark_val_max": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "min_blob_size": ("INT", {"default": 1800, "min": 10, "max": 10000, "step": 10}),
                 "num_positive_points": ("INT", {"default": 8, "min": 0, "max": 20, "step": 1}),
-                "num_negative_points": ("INT", {"default": 2, "min": 0, "max": 10, "step": 1}),
+                "num_negative_points": ("INT", {"default": 3, "min": 0, "max": 10, "step": 1}),
                 "erosion_kernel": ("INT", {"default": 3, "min": 1, "max": 15, "step": 1}),
             }
         }
@@ -438,7 +521,7 @@ class GroundingDinoSAM2SegmentV2:
         previews = []
         temp_path = folder_paths.get_temp_directory()
 
-        # --- constant gap for inverse mode ---
+        # Inverse-mode gap (deg) when we auto-compute negatives as inverse hues
         inverse_gap_deg = 12.0
 
         for item in image:
@@ -476,17 +559,14 @@ class GroundingDinoSAM2SegmentV2:
             light_mask_full = cv2.erode(light_mask_full, kernel, iterations=1)
             light_mask_full = cv2.dilate(light_mask_full, kernel, iterations=1)
 
-            # Negative mask:
-            #  - inverse-of-positive with small gap if dark_hue range is "off" (very narrow)
-            #  - otherwise use explicit dark_hue_min/max & dark_val_max
+            # Negative mask (inverse or explicit)
             use_inverse = (abs(dark_hue_max - dark_hue_min) < 2.0)
             if use_inverse:
                 gap_min = max(0.0, light_hue_min - inverse_gap_deg)
                 gap_max = min(360.0, light_hue_max + inverse_gap_deg)
-                # Build hue ranges outside [gap_min, gap_max]
                 mask_neg1 = None
                 mask_neg2 = None
-                v_max = 255.0 * dark_val_max  # allow brightness control if desired
+                v_max = 255.0 * dark_val_max
                 if gap_min > 0.0:
                     lower1 = np.array([0.0, 0.0, 0.0])
                     upper1 = np.array([(gap_min - 1e-6) / 2.0, 255.0, v_max])
@@ -534,6 +614,7 @@ class GroundingDinoSAM2SegmentV2:
                     # Crop ROI masks to the box
                     lm = light_mask_full[y1:y2, x1:x2]
                     dm = dark_mask_full[y1:y2, x1:x2]
+                    hsv_roi = hsv[y1:y2, x1:x2, :]
 
                     pos_pts_abs = []
                     neg_pts_abs = []
@@ -549,31 +630,29 @@ class GroundingDinoSAM2SegmentV2:
                         )
                         pos_pts_abs = [[x1 + float(px), y1 + float(py)] for (px, py) in pos_pts_roi]
 
-                    # NEGATIVES: strictly obey the requested count; prefer ring ∩ inverse-hue
+                    # NEGATIVES: scored selection, strictly capped
                     if num_negative_points > 0:
-                        dil = cv2.dilate(lm, kernel, iterations=1)
-                        ring = cv2.subtract(dil, lm)
-                        ring_and_dark = cv2.bitwise_and(ring, dm)
+                        # safety_erode scales a small buffer so we don't sample right on croc borders
+                        safe_erode = max(1, int(round(1.5 * scale_factor)))
+                        neg_pts_roi = pick_negative_points_scored(
+                            hsv_roi, lm, dm, num_negative_points,
+                            light_hue_min, light_hue_max,
+                            min_sep_px=max(8, int(round(2 * scale_factor * erosion_kernel))),
+                            safe_erode=safe_erode
+                        )
 
-                        neg_pts_roi = []
-                        if np.count_nonzero(ring_and_dark) > 0:
-                            neg_pts_roi = get_control_points(
-                                ring_and_dark, 3, num_negative_points,
+                        # Fallback if scored method found nothing: try ring∩dark for robustness
+                        if len(neg_pts_roi) < num_negative_points:
+                            dil = cv2.dilate(lm, kernel, iterations=1)
+                            ring = cv2.subtract(dil, lm)
+                            ring_and_dark = cv2.bitwise_and(ring, dm)
+                            remaining = num_negative_points - len(neg_pts_roi)
+                            more = get_control_points(
+                                ring_and_dark, 3, remaining,
                                 min_sep=max(8, int(round(2 * scale_factor * erosion_kernel))),
                                 enforce_coverage=False
                             )
-
-                        # fallback: anywhere in (inverse hue) but not in positive hue
-                        if len(neg_pts_roi) < num_negative_points:
-                            remaining = num_negative_points - len(neg_pts_roi)
-                            dm_only = cv2.bitwise_and(dm, cv2.bitwise_not(lm))
-                            if np.count_nonzero(dm_only) > 0 and remaining > 0:
-                                more = get_control_points(
-                                    dm_only, scaled_min_blob, remaining,
-                                    min_sep=max(8, int(round(2 * scale_factor * erosion_kernel))),
-                                    enforce_coverage=False
-                                )
-                                neg_pts_roi += more
+                            neg_pts_roi += more
 
                         neg_pts_abs = [[x1 + float(nx), y1 + float(ny)] for (nx, ny) in neg_pts_roi]
 
